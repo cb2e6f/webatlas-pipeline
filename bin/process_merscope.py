@@ -9,6 +9,8 @@ from __future__ import annotations
 import os
 import fire
 import logging
+
+import geopandas
 import h5py
 import pyvips
 import scanpy as sc
@@ -30,12 +32,58 @@ def merscope_to_anndata(path: str, filter_prefix: str = "Blank-") -> sc.AnnData:
         AnnData: AnnData object created from the MERSCOPE output data
     """
 
-    m = pd.read_csv(os.path.join(path, "cell_by_gene.csv"), index_col=0)
+    # what follows is unpleasant but a quick and dirty way to get things working for now
+
+    metadata_file = open(os.path.join(path, "cell_metadata.csv"), 'r')
+    by_gene_file = open(os.path.join(path, "cell_by_gene.csv"), 'r')
+
+    entityid_map_file = open("entityid_map.csv", 'w')
+    mapped_metadata_file = open("mapped_cell_metadata.csv", 'w')
+    mapped_by_gene_file = open("mapped_cell_by_gene.csv", 'w')
+
+    count = 0
+
+    for metadata_line in metadata_file:
+
+        by_gene_line = by_gene_file.readline()
+
+        if count == 0:
+            mapped_metadata_file.write(metadata_line)
+            mapped_by_gene_file.write(by_gene_line)
+            count = 1
+            continue
+
+        metadata_line_split = metadata_line.split(',')
+        by_gene_split = by_gene_line.split(',')
+
+        if metadata_line_split[0] != by_gene_split[0]:
+            print("entity id mismatch - this isn't going to work!")
+
+        entityid_map_file.write(str(count) + "," + metadata_line_split[0] + "\n")
+
+        metadata_line_split[0] = str(count)
+        mapped_metadata_file.write(",".join(metadata_line_split))
+
+        by_gene_split[0] = str(count)
+        mapped_by_gene_file.write(",".join(by_gene_split))
+
+        count = count + 1
+
+    mapped_by_gene_file.close()
+    mapped_metadata_file.close()
+
+    by_gene_file.close()
+    metadata_file.close()
+    entityid_map_file.close()
+
+    # back to our scheduled programming
+
+    m = pd.read_csv("mapped_cell_by_gene.csv", index_col=0)
     if filter_prefix and len(filter_prefix):
         m = m.loc[:, ~m.columns.str.startswith(filter_prefix)]
     m.index = m.index.astype(str)
 
-    cells = pd.read_csv(os.path.join(path, "cell_metadata.csv"), index_col=0)
+    cells = pd.read_csv("mapped_cell_metadata.csv", index_col=0)
     cells.index = cells.index.astype(str)
 
     adata = sc.AnnData(
@@ -93,6 +141,24 @@ def merscope_to_zarr(
 
     return zarr_file
 
+def create_cell_index(path: str) -> dict:
+    cell_id_index_count = 0
+    cell_id_index = {}
+    metadata_file = open(path, 'r')
+
+    for metadata_line in metadata_file:
+
+        if cell_id_index_count == 0:
+            cell_id_index_count = 1
+            continue
+
+        metadata_line_split = metadata_line.split(',')
+        cell_id_index[cell_id_index_count] = int(metadata_line_split[0])
+        cell_id_index[int(metadata_line_split[0])] = cell_id_index_count
+        cell_id_index_count = cell_id_index_count + 1
+
+    metadata_file.close()
+    return cell_id_index
 
 def merscope_label(
     stem: str, path: str, shape: tuple[int, int], z_index: list[int] = [0]
@@ -109,38 +175,66 @@ def merscope_label(
 
     z_index = [z_index] if not isinstance(z_index, (list, tuple)) else z_index
 
-    tm = pd.read_csv(
-        os.path.join(path, "images", "micron_to_mosaic_pixel_transform.csv"),
-        sep=" ",
-        header=None,
-        dtype=float,
-    ).values
+    if os.path.isdir(os.path.join(path, "cell_boundaries")):
 
-    fovs = [
-        x
-        for x in os.listdir(os.path.join(path, "cell_boundaries"))
-        if x.endswith(".hdf5")
-    ]
+        tm = pd.read_csv(
+            os.path.join(path, "images", "micron_to_mosaic_pixel_transform.csv"),
+            sep=" ",
+            header=None,
+            dtype=float,
+        ).values
 
-    for i, z in [(x, "zIndex_{}".format(x)) for x in z_index]:
-        label_img = np.zeros((shape[0], shape[1]), dtype=np.uint32)
+        fovs = [
+            x
+            for x in os.listdir(os.path.join(path, "cell_boundaries"))
+            if x.endswith(".hdf5")
+        ]
 
-        for fov in fovs:
-            with h5py.File(os.path.join(path, "cell_boundaries", fov)) as f:
-                for cell_id in f["featuredata"].keys():
-                    pol = f["featuredata"][cell_id][z]["p_0"]["coordinates"][0]
+        for i, z in [(x, "zIndex_{}".format(x)) for x in z_index]:
+            label_img = np.zeros((shape[0], shape[1]), dtype=np.uint32)
 
-                    pol[:, 0] = pol[:, 0] * tm[0, 0] + tm[0, 2]
-                    pol[:, 1] = pol[:, 1] * tm[1, 1] + tm[1, 2]
+            for fov in fovs:
+                with h5py.File(os.path.join(path, "cell_boundaries", fov)) as f:
+                    for cell_id in f["featuredata"].keys():
+                        pol = f["featuredata"][cell_id][z]["p_0"]["coordinates"][0]
 
-                    rr, cc = polygon(pol[:, 1], pol[:, 0])
-                    label_img[rr - 1, cc - 1] = int(cell_id)
+                        pol[:, 0] = pol[:, 0] * tm[0, 0] + tm[0, 2]
+                        pol[:, 1] = pol[:, 1] * tm[1, 1] + tm[1, 2]
 
-        logging.info(f"Writing label tif image {stem}-z{i}-label ...")
-        tf.imwrite(
-            f"{stem}-z{i}-label.tif" if len(z_index) > 1 else f"{stem}-label.tif",
-            label_img,
-        )
+                        rr, cc = polygon(pol[:, 1], pol[:, 0])
+                        label_img[rr - 1, cc - 1] = int(cell_id)
+
+            logging.info(f"Writing label tif image {stem}-z{i}-label ...")
+            tf.imwrite(
+                f"{stem}-z{i}-label.tif" if len(z_index) > 1 else f"{stem}-label.tif",
+                label_img,
+            )
+
+    else:
+
+        cell_index_map = create_cell_index(os.path.join(path, "cell_metadata.csv"))
+        geo_df = geopandas.read_parquet(os.path.join(path, "cellpose2_mosaic_space.parquet"))
+        geo_df = geo_df.rename_geometry("geometry")
+        geo_df["EntityID"] = geo_df["EntityID"].replace(cell_index_map)
+
+        for i, z in [(x, "zIndex_{}".format(x)) for x in z_index]:
+
+            label_img = np.zeros((shape[0], shape[1]), dtype=np.uint32)
+
+            geo_df_filtered = geo_df[geo_df["ZIndex"] == i]
+            geo_df_filtered.geometry = geo_df_filtered.geometry.map(lambda x: x.geoms[0])
+            geo_df_filtered.index = geo_df_filtered["EntityID"].astype(str)
+
+            for row in geo_df_filtered.itertuples():
+                y, x = row.geometry.exterior.coords.xy
+                rr, cc = polygon(x, y)
+                label_img[rr - 1, cc - 1] = int(row.Index)
+
+            logging.info(f"Writing label tif image {stem}-z{i}-label ...")
+            tf.imwrite(
+                f"{stem}-z{i}-label.tif" if len(z_index) > 1 else f"{stem}-label.tif",
+                label_img,
+            )
 
     return
 
