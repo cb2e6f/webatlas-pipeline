@@ -226,9 +226,13 @@ def merscope_label(
             geo_df_filtered.index = geo_df_filtered["EntityID"].astype(str)
 
             for row in geo_df_filtered.itertuples():
-                y, x = row.geometry.exterior.coords.xy
-                rr, cc = polygon(x, y)
-                label_img[rr - 1, cc - 1] = int(row.Index)
+                if int(row.Index) < len(cell_index_map): # yet another horrible hack
+                    y, x = row.geometry.exterior.coords.xy
+                    rr, cc = polygon(x, y)
+                    label_img[rr - 1, cc - 1] = int(row.Index)
+
+            # uncomment if the image has been flipped
+            label_img = np.flip(label_img)
 
             logging.info(f"Writing label tif image {stem}-z{i}-label ...")
             tf.imwrite(
@@ -256,8 +260,9 @@ def merscope_raw(stem: str, path: str, z_index: list[int] = [0]) -> None:
     imgs.sort()
 
     z_imgs = set([os.path.splitext(x)[0].split("_")[2] for x in imgs])
-    if z_index and len(z_index):
-        z_imgs = z_imgs.intersection(set(["z{}".format(x) for x in z_index]))
+    # don't really need all the images do we
+    # if z_index and len(z_index):
+    #     z_imgs = z_imgs.intersection(set(["z{}".format(x) for x in z_index]))
 
     for z in z_imgs:
         t_imgs = [x for x in imgs if x.endswith("{}.tif".format(z))]
